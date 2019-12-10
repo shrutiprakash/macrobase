@@ -4,6 +4,7 @@ import edu.stanford.futuredata.macrobase.analysis.summary.util.*;
 import edu.stanford.futuredata.macrobase.analysis.summary.util.qualitymetrics.AggregationOp;
 import edu.stanford.futuredata.macrobase.analysis.summary.util.qualitymetrics.QualityMetric;
 import edu.stanford.futuredata.macrobase.util.MacroBaseInternalError;
+import java.util.stream.Collectors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.roaringbitmap.RoaringBitmap;
@@ -20,6 +21,8 @@ import static edu.stanford.futuredata.macrobase.analysis.summary.aplinear.Bitmap
  * are the most interesting as defined by "quality metrics" on these aggregates.
  */
 public class APrioriLinear {
+
+    private AttributeEncoder encoder;
     private Logger log = LoggerFactory.getLogger("APrioriLinear");
 
     // **Parameters**
@@ -32,10 +35,18 @@ public class APrioriLinear {
     // Aggregate values for all of the sets we saved
     private HashMap<Integer, Map<IntSet, double []>> savedAggregates;
 
+
+    private void debugCombo(IntSet combo, double[] aggregates) {
+        log.info(String.join(", ", combo.getSet().stream().map(encoder::decodeValue).collect(Collectors.toList())) + ": [" + String.join(", ",
+            Arrays.stream(aggregates).mapToObj(i -> "" + i).collect(Collectors.toList())) + "]");
+    }
+
     public APrioriLinear(
             List<QualityMetric> qualityMetrics,
-            List<Double> thresholds
+            List<Double> thresholds,
+            AttributeEncoder encoder
     ) {
+        this.encoder = encoder;
         this.qualityMetrics = qualityMetrics.toArray(new QualityMetric[0]);
         this.thresholds = new double[thresholds.size()];
         for (int i = 0; i < thresholds.size(); i++) {
@@ -55,7 +66,8 @@ public class APrioriLinear {
             int numThreads,
             HashMap<Integer, RoaringBitmap>[][] bitmap,
             ArrayList<Integer>[] outlierList,
-            boolean[] isBitmapEncoded
+            boolean[] isBitmapEncoded,
+            boolean evaluateAntiDiff
     ) {
         final long beginTime = System.currentTimeMillis();
         final int numAggregates = aggregateColumns.length;
@@ -75,6 +87,7 @@ public class APrioriLinear {
         } else{
             useIntSetAsArray = false;
         }
+        log.info("ANTI DIFF: {}", evaluateAntiDiff);
         log.info("NumThreads: {}", numThreads);
         // Shard the dataset by rows for the threads, but store it by column for fast processing
         final int[][][] byThreadAttributesTranspose =
@@ -287,28 +300,52 @@ public class APrioriLinear {
             // Prune all the collected aggregates
             HashSet<IntSet> curOrderNext = new HashSet<>();
             HashSet<IntSet> curOrderSaved = new HashSet<>();
-            for (IntSet curCandidate: setAggregates.keySet()) {
-                QualityMetric.Action action = QualityMetric.Action.KEEP;
-                if (curOrder == 1 && curCandidate.getFirst() == AttributeEncoder.noSupport) {
-                    action = QualityMetric.Action.PRUNE;
-                } else {
-                    double[] curAggregates = setAggregates.get(curCandidate);
-                    for (int i = 0; i < qualityMetrics.length; i++) {
-                        QualityMetric q = qualityMetrics[i];
-                        double t = thresholds[i];
-                        action = QualityMetric.Action.combine(action, q.getAction(curAggregates, t));
-                    }
-                    if (action == QualityMetric.Action.KEEP) {
-                        // Make sure the candidate isn't already covered by a pair
-                        if (curOrder != 3 || allPairsValid(curCandidate, setNext.get(2))) {
-                            // if a set is already past the threshold on all metrics,
-                            // save it and no need for further exploration if we do containment
-                            curOrderSaved.add(curCandidate);
+            if (!evaluateAntiDiff) {
+                for (IntSet curCandidate: setAggregates.keySet()) {
+                    QualityMetric.Action action = QualityMetric.Action.KEEP;
+                    if (curOrder == 1 && curCandidate.getFirst() == AttributeEncoder.noSupport) {
+                        action = QualityMetric.Action.PRUNE;
+                    } else {
+                        double[] curAggregates = setAggregates.get(curCandidate);
+                        for (int i = 0; i < qualityMetrics.length; i++) {
+                            QualityMetric q = qualityMetrics[i];
+                            double t = thresholds[i];
+                            action = QualityMetric.Action.combine(action, q.getAction(curAggregates, t));
                         }
-                    } else if (action == QualityMetric.Action.NEXT) {
-                        // otherwise if a set still has potentially good subsets,
-                        // save it for further examination
-                        curOrderNext.add(curCandidate);
+                        if (action == QualityMetric.Action.KEEP) {
+                            // Make sure the candidate isn't already covered by a pair
+                            if (curOrder != 3 || allPairsValid(curCandidate)) {
+                                // if a set is already past the threshold on all metrics,
+                                // save it and no need for further exploration if we do containment
+                                curOrderSaved.add(curCandidate);
+                            }
+                        } else if (action == QualityMetric.Action.NEXT) {
+                            // otherwise if a set still has potentially good subsets,
+                            // save it for further examination
+                            curOrderNext.add(curCandidate);
+                        }
+                    }
+                }
+            } else {
+                for (IntSet curCandidate: setAggregates.keySet()) {
+                    debugCombo(curCandidate, setAggregates.get(curCandidate));
+                    QualityMetric.Action action = QualityMetric.Action.KEEP;
+                    if (curOrder != 1 || curCandidate.getFirst() != AttributeEncoder.noSupport) {
+                        double[] curAggregates = setAggregates.get(curCandidate);
+                        // NOTE: this assumes that outlier count is the first aggregate in the array
+                        // TODO: come up with a cleaner solution
+                        if (curAggregates[0] == 0.0) {
+                            continue;
+                        }
+                        for (int i = 0; i < qualityMetrics.length; i++) {
+                            QualityMetric q = qualityMetrics[i];
+                            double t = thresholds[i];
+                            action = QualityMetric.Action.combine(action, q.getAction(curAggregates, t));
+                        }
+                        if (action == QualityMetric.Action.PRUNE || action == QualityMetric.Action.NEXT) {
+                            curOrderSaved.add(curCandidate);
+                            curOrderNext.add(curCandidate);
+                        }
                     }
                 }
             }
@@ -329,7 +366,17 @@ public class APrioriLinear {
         }
         log.info("Time spent in APriori:  {} ms", System.currentTimeMillis() - beginTime);
 
-
+//        if (evaluateAntiDiff) {
+//            // if we're evaluating the Anti-DIFF, anything that was not pruned or saved (under
+//            // normal DIFF evaluation) should be saved
+//            for (int curOrder: setNext.keySet()) {
+//                HashSet<IntSet> curOrderNext = setNext.get(curOrder);
+//                Map<IntSet, double []> curSavedAggregates = savedAggregates.get(curOrder);
+//                for (IntSet curSet: curOrderNext) {
+//                    curSavedAggregates.put(curSet, setAggregates.get(curSet));
+//                }
+//            }
+//        }
 
         List<APLExplanationResult> results = new ArrayList<>();
         for (int curOrder: savedAggregates.keySet()) {
@@ -350,27 +397,20 @@ public class APrioriLinear {
 
     /**
      * Check if all order-2 subsets of an order-3 candidate are valid candidates.
-     * @param o2Candidates All candidates of order 2 with minimum support.
      * @param curCandidate An order-3 candidate
      * @return Boolean
      */
-    private boolean allPairsValid(IntSet curCandidate,
-                                      HashSet<IntSet> o2Candidates) {
-            IntSet subPair;
-            subPair = new IntSetAsArray(
-                    curCandidate.getFirst(),
-                    curCandidate.getSecond());
+    private boolean allPairsValid(IntSet curCandidate) {
+        HashSet<IntSet> o2Candidates = setNext.get(2);
+        IntSet subPair;
+        subPair = new IntSetAsArray(curCandidate.getFirst(), curCandidate.getSecond());
+        if (o2Candidates.contains(subPair)) {
+            subPair = new IntSetAsArray(curCandidate.getSecond(), curCandidate.getThird());
             if (o2Candidates.contains(subPair)) {
-                subPair = new IntSetAsArray(
-                        curCandidate.getSecond(),
-                        curCandidate.getThird());
-                if (o2Candidates.contains(subPair)) {
-                    subPair = new IntSetAsArray(
-                            curCandidate.getFirst(),
-                            curCandidate.getThird());
-                    return o2Candidates.contains(subPair);
-                }
+                subPair = new IntSetAsArray(curCandidate.getFirst(), curCandidate.getThird());
+                return o2Candidates.contains(subPair);
             }
+        }
         return false;
     }
 }

@@ -23,6 +23,7 @@ public abstract class BatchSummarizer implements Operator<DataFrame, Explanation
     protected int numThreads = Runtime.getRuntime().availableProcessors();
     protected String ratioMetric = "global_ratio";
     protected int maxOrder = 3;
+    protected boolean anti = false;
 
     /**
      * Adjust this to tune the significance (e.g. number of rows affected) of the results returned.
@@ -81,6 +82,11 @@ public abstract class BatchSummarizer implements Operator<DataFrame, Explanation
                 " cannot be less than 1 or greater than 3");
         }
         this.maxOrder = maxOrder;
+        return this;
+    }
+
+    public BatchSummarizer setAnti(boolean anti) {
+        this.anti = anti;
         return this;
     }
 }
